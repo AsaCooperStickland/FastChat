@@ -1,3 +1,4 @@
+
 """Generate answers with local models.
 
 Usage:
@@ -103,16 +104,47 @@ def get_model_answers(
         cpu_offloading=False,
         debug=False,
     )
-    layer_ids = list(range(-11, -30, -1))
+    start_layer, end_layer = custom_args['start_layer'], custom_args['end_layer']
+    layer_ids = list(range(start_layer, end_layer, -1))
+    # layer_ids = list(range(-11, -30, -1))
     block_name = "decoder_block"
     if custom_args['do_steer']:
         print(f"Steering model {model_id} with {custom_args['steering_dataset']}, coefficient {custom_args['steering_coeff']}")
         steering = Steering(custom_args['steering_dataset'], model, tokenizer, custom_args['steering_data_path'], custom_args)
         steering.wrapped_model.reset()
-        activations = steering.get_shift(coeff=custom_args['steering_coeff'], layer_id=layer_ids, mode="test", num_pairs=200)
+        
+    
+        with open(f"{custom_args['base_directory']}/lat/finetuning/steering_data/norms_llama-2-7b.json", "r") as f:
+            norms_dict = json.load(f)
+        activations = steering.get_shift(coeff=1.0, layer_id=steering.layer_id, num_pairs=200, mode='train')
+        if custom_args['direction_method'] == 'cluster_mean' and not custom_args['steering_unnormalized']:
+            print("Normalizing raw cluster_mean activations")
+            activations = {k: v / torch.norm(str(k)) for k, v in activations.items()}
+            # rror: can't convert cuda:0 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first
+        if custom_args['direction_method'] == 'pca' and custom_args['steering_unnormalized']:
+            print("Unnormalizing raw pca activations")
+            if steering.norms_dict is None:
+                activations = {k: v * norms_dict[str(k)] for k, v in activations.items()}
+                print("Unnormalizing raw pca activations in gen_model_answer.py")
+        
+        decay_end_layer = end_layer + 1
+        decay_start_layer = -15
+        decay_range_1 = abs(start_layer - decay_start_layer)
+        decay_range_2 = abs(decay_end_layer - decay_start_layer)
+
         for key in activations:
+            # Calculate linear decay factor for each layer
+            layer_id = int(key)
+            if decay_start_layer <= layer_id:
+                decay_factor = (abs(layer_id - start_layer) / decay_range_1)
+            else:
+                decay_factor = (abs(layer_id - decay_end_layer) / decay_range_2)
+            # activations = steering.get_shift(coeff=custom_args['steering_coeff'], layer_id=layer_ids, mode="test", num_pairs=200)
+            if custom_args["decay_coefficient"]:
+                activations[key] = activations[key] * decay_factor
+            activations[key] = activations[key] * custom_args['steering_coeff']
             activations[key] = activations[key].to(dtype)
-        steering.wrapped_model.set_controller(layer_ids, activations, block_name)
+        steering.wrapped_model.set_controller(layer_ids, activations, block_name, token_pos=custom_args['token_pos'], normalize=custom_args['normalize'])
         steering.wrapped_model.to(dtype)
 
     for question in tqdm(questions):
@@ -194,6 +226,7 @@ def get_model_answers(
 
                 conv.update_last_message(output)
                 turns.append(output)
+                print(output)
 
             choices.append({"index": i, "turns": turns})
 
@@ -303,22 +336,37 @@ if __name__ == "__main__":
                         choices=['random', 'pca', 'cluster_mean'])
     parser.add_argument('--buffer_size', type=int, default=0)
     parser.add_argument('--steering_coeff', type=float, default=0.0)
+    parser.add_argument('--token_pos', type=str, default=None)
     parser.add_argument('--do_steer', action='store_true')
+    parser.add_argument('--normalize', action='store_true')
+    parser.add_argument('--decay_coefficient', action='store_true')
+    parser.add_argument('--steering_unnormalized', action='store_true')
+    parser.add_argument('--start_layer', type=int, default=-11)
+    parser.add_argument('--end_layer', type=int, default=-30)
+    parser.add_argument('--base_directory', default='/scratch/alc9734/latent-adversarial-training/')
 
     args = parser.parse_args()
 
     custom_args = {
         "steering_data_path": args.steering_data_path,
         'steering_dataset': args.steering_dataset,
+        'base_directory': args.base_directory,
         'buffer_size': args.buffer_size,
         'rep_token': args.rep_token,
         'direction_method': args.direction_method,
+        'start_layer': args.start_layer,
+        'end_layer': args.end_layer,
+        'steering_unnormalized': args.steering_unnormalized,
         'steering_coeff': args.steering_coeff,
+        'token_pos': args.token_pos,
         'do_steer': args.do_steer,
+        'normalize': args.normalize,
         'mix_with_clean_data': False,
         'subsample_steering_data': False,
         'finetuning_type': 'full',
         'model_name_or_path': args.model_path,
+        'merge_adapter': True,
+        'decay_coefficient': args.decay_coefficient,
     }
 
     if args.num_gpus_total // args.num_gpus_per_model > 1:

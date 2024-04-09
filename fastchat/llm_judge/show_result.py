@@ -14,21 +14,38 @@ def display_result_single(args):
     pd.set_option('display.width', None)  # Use maximum width available
 
     if args.input_file is None:
-        input_file = f"data/{args.bench_name}/model_judgment/{args.judge_model}_single.jsonl"
+        input_file = f"data/{args.bench_name}/model_judgment/{args.judge_model}_single_filtered.jsonl"
     else:
         input_file = args.input_file
 
     print(f"Input file: {input_file}")
     df_all = pd.read_json(input_file, lines=True)
-    df = df_all[["model", "score", "turn"]]
+    print(df_all.columns)
+    # Index(['question_id', 'model', 'judge', 'user_prompt', 'judgment', 'score',
+    #   'turn', 'tstamp'],
+    # Remove any duplicate (question_id, model, user_prompt, turn) tuples
+    df_all = df_all.drop_duplicates(subset=["question_id", "model", "user_prompt", "turn"])
+    # df_all = df_all[~df_all["model"].str.contains("mean|pca")]
+    # print out model list
+    print(f"Number of outputs: {len(df_all)}")
+    print(df_all["model"].unique())
+    # drop everything with the word "decay" in model
+    # df_all = df_all[~df_all["model"].str.contains("decay")]
+    # Save new dataframe to a jsonl file
+    # df_all.to_json(f"data/mt_bench/model_judgment/{args.judge_model}_single_filtered.jsonl", orient="records", lines=True)
+    df = df_all[["model", "score", "turn", "question_id"]]
     df = df[df["score"] != -1]
-
+    # filter out any model which contains the word "mean" or "pca"
+    
     if args.model_list is not None:
         df = df[df["model"].isin(args.model_list)]
-
+    # loop through models and show how many outputs are stored
+    for model in df["model"].unique():
+        print(f"Model: {model}, number of outputs: {len(df[df['model'] == model])}")
+        
     print("\n########## First turn ##########")
     df_1 = df[df["turn"] == 1].groupby(["model", "turn"]).mean()
-    print(df_1.sort_values(by="score", ascending=False))
+    print(df_1.sort_values(by="score", ascending=False))        
 
     if args.bench_name == "mt_bench":
         print("\n########## Second turn ##########")
@@ -38,7 +55,67 @@ def display_result_single(args):
         print("\n########## Average ##########")
         df_3 = df[["model", "score"]].groupby(["model"]).mean()
         print(df_3.sort_values(by="score", ascending=False))
+    
+    if args.verbose:
+        show_relative_drop(df)
+        df_turn_1 = df[df["turn"] == 1]
+        show_relative_drop(df_turn_1)
+        
+        results_dictionary = {}
+        # For each model name, store the average score for each turn and overall
+        for model in df["model"].unique():
+            df_model = df[df["model"] == model]
+            results_dictionary[model] = {}
+            for turn in [1, 2]:
+                df_turn = df_model[df_model["turn"] == turn]
+                results_dictionary[model][f"turn_{turn}"] = df_turn["score"].mean()
+            results_dictionary[model]["overall"] = df_model["score"].mean()
+        print(f"results_dictionary = {results_dictionary}")
 
+def show_relative_drop(df):
+        
+    suffixes_1 = [
+        # "",
+        # "_coeff_1.5_refusal_data_full_answers",
+        "_coeff_-1.5_refusal_data_full_answers",
+        # "_coeff_1.5_refusal_data_A_B_question_pairs",
+        "_coeff_-1.5_refusal_data_A_B_question_pairs",
+    ]
+    suffixes_2 = [
+        "_coeff_1.5_refusal_data_full_answers",
+        # "_coeff_-1.5_refusal_data_full_answers",
+        "_coeff_1.5_refusal_data_A_B_question_pairs",
+        # "_coeff_-1.5_refusal_data_A_B_question_pairs",
+    ]
+
+    suffixes = suffixes_1 + suffixes_2
+    # For all base models, show the average drop in score when the suffix is added
+    base_models = [model for model in df["model"].unique() if not any(suffix in model for suffix in suffixes)]
+    for base_model in base_models:
+        # Check if all suffixes are contained for this base model
+        if (not all([base_model + suffix in df["model"].unique() for suffix in suffixes_1]) and
+                not all([base_model + suffix in df["model"].unique() for suffix in suffixes_2])):
+            continue
+        print(f"\n########## {base_model} ##########")
+        all_diffs = []
+        min_diff = -1000
+        df_base = df[df["model"] == base_model]
+        existing_suffixes = [suffix for suffix in suffixes if base_model + suffix in df["model"].unique()]
+        for suffix in existing_suffixes:
+            model = base_model + suffix
+            df_model = df[df["model"] == model]
+            df_diff = df_model.merge(df_base, on=["turn", "question_id"], suffixes=("_" + suffix, "_base"))
+            df_diff["diff"] = df_diff["score_" + suffix] - df_diff["score_base"]
+            diff = df_diff['diff'].mean()
+            all_diffs.append(diff)
+            min_diff = max(min_diff, diff)
+            print(f"Suffix: {suffix}, diff: {diff}")
+        original_score = df_base['score'].mean()
+        average_diff = sum(all_diffs) / len(all_diffs)
+        average_diff_fraction = average_diff / original_score
+        print(f"Original score: {original_score} Min diff: {min_diff}, average diff: {average_diff}, average diff fraction: {average_diff_fraction}")
+    
+    
 
 def display_result_pairwise(args):
     if args.input_file is None:
@@ -100,6 +177,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bench-name", type=str, default="mt_bench")
     parser.add_argument("--input-file", type=str)
+    parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--judge-model", type=str, default="gpt-4")
     parser.add_argument("--baseline-model", type=str, default="gpt-3.5-turbo")
     parser.add_argument(
